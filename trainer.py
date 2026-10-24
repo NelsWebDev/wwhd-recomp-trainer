@@ -745,6 +745,8 @@ class TrainerApp:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
         variable = tk.StringVar(value=next(iter(choices)))
         self.variables[key] = variable
+        self.choice_maps = getattr(self, "choice_maps", {})
+        self.choice_maps[key] = choices
         selector = ttk.Combobox(
             parent, textvariable=variable, values=tuple(choices), state="readonly", width=29
         )
@@ -880,6 +882,16 @@ class TrainerApp:
                 ("bombs", "u8"), ("max_arrows", "u8"), ("max_bombs", "u8"),
             ):
                 self.variables[key].set(str(self.game.read(OFFSETS[key], kind)))
+            for key, choices in getattr(self, "choice_maps", {}).items():
+                raw = int(self.game.read(OFFSETS[key], "u8"))
+                labels = {value: label for label, value in choices.items()}
+                if raw in labels:
+                    self.variables[key].set(labels[raw])
+                else:
+                    # Fall back to the highest known level whose bits are all set.
+                    known = [v for v in choices.values() if v and raw & v == v]
+                    best = max(known, default=0)
+                    self.variables[key].set(labels[best])
             capacity = int(self.game.read(OFFSETS["rupee_capacity"], "u8"))
             self.wallet_cap.set({0: "500", 1: "1000", 2: "5000"}.get(capacity, "500"))
             self.magic_cap.set(str(self.game.read(OFFSETS["max_magic"], "u8")))
