@@ -100,6 +100,21 @@ PLAY_BASE = 0x1046F0B0
 NEXT_STAGE = PLAY_BASE + 0x5140
 CURRENT_STAGE = PLAY_BASE + 0x5134
 
+_SEA_ROWS = (
+    "Forsaken Fortress|Star Island|Northern Fairy Island|Gale Isle|Crescent Moon Island|Seven-Star Isles|Overlook Island",
+    "Four-Eye Reef|Mother & Child Isles|Spectacle Island|Windfall Island|Pawprint Isle|Dragon Roost Island|Flight Control Platform",
+    "Western Fairy Island|Rock Spire Isle|Tingle Island|Northern Triangle Island|Eastern Fairy Island|Fire Mountain|Star Belt Archipelago",
+    "Three-Eye Reef|Greatfish Isle|Cyclops Reef|Six-Eye Reef|Tower of the Gods|Eastern Triangle Island|Thorned Fairy Island",
+    "Needle Rock Isle|Islet of Steel|Stone Watcher Island|Southern Triangle Island|Private Oasis|Bomb Island|Bird's Peak Rock",
+    "Diamond Steppe Island|Five-Eye Reef|Shark Island|Southern Fairy Island|Ice Ring Isle|Forest Haven|Cliff Plateau Isles",
+    "Horseshoe Island|Outset Island|Headstone Island|Two-Eye Reef|Angular Isles|Boating Course|Five-Star Isles",
+)
+SEA_SECTORS = {
+    f"{chr(ord('A') + r)}{c + 1}": name
+    for r, row in enumerate(_SEA_ROWS)
+    for c, name in enumerate(row.split("|"))
+}
+
 WARP_PRESETS = {
     "Great Sea": ("sea", 0, 0),
     "Forsaken Fortress": ("M_NewD2", 0, 0),
@@ -531,18 +546,22 @@ class TrainerApp:
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         chart = self._group(self.warp_tab, "Sea chart (click a sector to warp there)")
-        landmarks = {"A1": "Fortress", "B4": "Windfall", "G2": "Outset"}
         for col in range(7):
             ttk.Label(chart, text=str(col + 1), style="Muted.TLabel").grid(row=0, column=col + 1)
+        self.sector_name_var = tk.StringVar(value="Hover a sector to see its island.")
         for row in range(7):
             letter = chr(ord("A") + row)
             ttk.Label(chart, text=letter, style="Muted.TLabel").grid(row=row + 1, column=0, padx=(0, 4))
             for col in range(7):
                 name = f"{letter}{col + 1}"
-                ttk.Button(
-                    chart, text=landmarks.get(name, name), width=9,
-                    command=lambda n=name: self._warp_sea(n),
-                ).grid(row=row + 1, column=col + 1, padx=1, pady=1)
+                button = ttk.Button(
+                    chart, text=name, width=3, command=lambda n=name: self._warp_sea(n)
+                )
+                button.grid(row=row + 1, column=col + 1, padx=1, pady=1)
+                button.bind("<Enter>", lambda _e, n=name: self.sector_name_var.set(f"{n}: {SEA_SECTORS[n]}"))
+        ttk.Label(chart, textvariable=self.sector_name_var, style="Muted.TLabel").grid(
+            row=8, column=0, columnspan=8, sticky="w", pady=(6, 0)
+        )
 
     def _warp_sea(self, name: str) -> None:
         room = (ord(name[0]) - ord("A")) * 7 + int(name[1])
