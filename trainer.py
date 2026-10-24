@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wind Waker HD trainer for Cemu on macOS."""
+"""Trainer for the Wind Waker HD native port (ZeldaWWHDRecomp) on macOS."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import ctypes
 import ctypes.util
 import math
 import os
-import re
 import struct
 import subprocess
 import sys
@@ -16,7 +15,30 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 
-OFFSETS = {
+# The port reserves the Wii U's 4 GiB guest address space at a fixed host address (PPC_MEM_BASE
+# in runtime/include/ppc.h) and stores it big-endian: host address = base + guest address.
+DEFAULT_GUEST_BASE = 0x200000000000
+
+# The save data (dSv_player_c) is heap allocated; the game keeps a pointer to it at this guest
+# address, and the player data starts 0x20 bytes into it (see runtime/src/mods/cheats.cpp).
+SAVE_POINTER = 0x101F84DC
+SAVE_PLAYER_DELTA = 0x20
+
+# The offsets below are the original Cemu trainer's guest addresses. Those inside the save data
+# starting at 0x145B7B80 are converted to save-relative values (marked by SAVE_REL) and resolved
+# through SAVE_POINTER at access time; the rest are static guest addresses.
+CEMU_SAVE_START = 0x145B7B80
+CEMU_SAVE_SIZE = 0x800
+SAVE_REL = 1 << 40
+
+
+def _runtime_address(address: int) -> int:
+    if CEMU_SAVE_START <= address < CEMU_SAVE_START + CEMU_SAVE_SIZE:
+        return SAVE_REL + address - CEMU_SAVE_START
+    return address
+
+
+_CEMU_OFFSETS = {
     "player_x": 0x1046CD48,
     "player_y": 0x1046CD50,
     "player_z": 0x1046CD4C,
@@ -25,8 +47,8 @@ OFFSETS = {
     "rupees_ui": 0x10474C5E,
     "rupees": 0x145B7B84,
     "rupee_capacity": 0x145B7B92,
-    "max_stamina": 0x145B7B93,
-    "stamina": 0x145B7B94,
+    "max_magic": 0x145B7B93,
+    "magic": 0x145B7B94,
     "breath": 0x10474BFE,
     "sword": 0x145B7C34,
     "shield": 0x145B7C35,
@@ -46,8 +68,9 @@ OFFSETS = {
     "songs": 0x145B7C3D,
     "bow": 0x145B7BDD,
 }
+OFFSETS = {name: _runtime_address(address) for name, address in _CEMU_OFFSETS.items()}
 
-GEAR_FLAGS = {
+_CEMU_GEAR_FLAGS = {
     "Telescope": 0x145B7BD1,
     "Sail": 0x145B7BD2,
     "Wind Waker": 0x145B7BD3,
@@ -66,20 +89,25 @@ GEAR_FLAGS = {
     "Hookshot": 0x145B7BE4,
     "Skull Hammer": 0x145B7BE5,
 }
+GEAR_FLAGS = {name: _runtime_address(address) for name, address in _CEMU_GEAR_FLAGS.items()}
+
+INVENTORY_SLOTS = _runtime_address(0x145B7BBC)
+EMPTY_SLOT = 0xFF
 
 SONG_NAMES = (
     "Wind's Requiem",
-    "Song of Passing",
-    "Command Melody",
     "Ballad of Gales",
+    "Command Melody",
     "Earth God's Lyric",
     "Wind God's Aria",
+    "Song of Passing",
 )
 
 INVENTORY_ITEMS = {
-    "Empty slot": 0,
+    "Empty slot": EMPTY_SLOT,
     "Joy Pendant": 31,
     "Telescope": 32,
+    "Sail": 120,
     "Tingle Bottle": 33,
     "Wind Waker": 34,
     "Picto Box": 35,
@@ -141,7 +169,7 @@ INVENTORY_ITEMS = {
 
 def pack_value(value: int | float, kind: str) -> bytes:
     """Encode a value using the game's big-endian representation."""
-    formats = {"u8": ">B", "u16": ">H", "f32": ">f"}
+    formats = {"u8": ">B", "u16": ">H", "u32": ">I", "f32": ">f"}
     try:
         return struct.pack(formats[kind], value)
     except (KeyError, struct.error) as exc:
@@ -149,47 +177,38 @@ def pack_value(value: int | float, kind: str) -> bytes:
 
 
 def unpack_value(data: bytes, kind: str) -> int | float:
-    formats = {"u8": ">B", "u16": ">H", "f32": ">f"}
+    formats = {"u8": ">B", "u16": ">H", "u32": ">I", "f32": ">f"}
     try:
         return struct.unpack(formats[kind], data)[0]
     except (KeyError, struct.error) as exc:
         raise ValueError(f"Invalid {kind} data") from exc
 
 
-def find_cemu_pid() -> int | None:
+def is_game_process(command: str) -> bool:
+    """Match the port's executable ("Wind Waker HD", "wind-waker-hd", "wwhd")."""
+    name = Path(command).name.lower()
+    for separator in " -_.":
+        name = name.replace(separator, "")
+    return name in ("windwakerhd", "wwhd")
+
+
+def find_game_pids() -> list[int]:
     result = subprocess.run(
         ["/bin/ps", "-axo", "pid=,comm="],
         check=True,
         capture_output=True,
         text=True,
     )
-    matches = []
+    pids = []
     for line in result.stdout.splitlines():
         fields = line.strip().split(None, 1)
-        if len(fields) == 2 and Path(fields[1]).name.lower() == "cemu":
-            matches.append(int(fields[0]))
-    return matches[0] if len(matches) == 1 else None
-
-
-def find_cemu_base() -> int | None:
-    """Find the latest Cemu base address in its log, if one is available."""
-    candidates = [
-        Path.home() / "Library/Application Support/Cemu/log.txt",
-        Path.home() / "Library/Application Support/Cemu/cemu/log.txt",
-    ]
-    for log_path in candidates:
-        try:
-            text = log_path.read_text(errors="replace")
-        except OSError:
-            continue
-        addresses = re.findall(r"\bbase:\s*(0x[0-9a-f]+)", text, re.IGNORECASE)
-        if addresses:
-            return int(addresses[-1], 16)
-    return None
+        if len(fields) == 2 and is_game_process(fields[1]):
+            pids.append(int(fields[0]))
+    return pids
 
 
 class MachProcessMemory:
-    """Minimal read/write access to a same-user Cemu process via Mach APIs."""
+    """Minimal read/write access to the game process via Mach APIs."""
 
     def __init__(self) -> None:
         self._connected = False
@@ -236,13 +255,13 @@ class MachProcessMemory:
         )
         if result != 0:
             raise OSError(
-                f"macOS denied access to Cemu (Mach error {result}). "
+                f"macOS denied access to Wind Waker HD (Mach error {result}). "
                 + (
                     "Process access requires administrator rights: quit and run "
                     "'sudo python3 trainer.py' from Terminal."
                     if os.geteuid() != 0
-                    else "Cemu is signed with the hardened runtime; re-sign it with "
-                    "the get-task-allow entitlement (see README)."
+                    else "The game app is signed with the hardened runtime; re-sign "
+                    "your copy with the get-task-allow entitlement (see README)."
                 )
             )
         self._connected = True
@@ -254,7 +273,7 @@ class MachProcessMemory:
 
     def read(self, address: int, size: int) -> bytes:
         if not self._connected:
-            raise OSError("Not connected to Cemu.")
+            raise OSError("Not connected to the game.")
         buffer = ctypes.create_string_buffer(size)
         copied = ctypes.c_uint64()
         result = self._read(
@@ -265,12 +284,12 @@ class MachProcessMemory:
             ctypes.byref(copied),
         )
         if result != 0 or copied.value != size:
-            raise OSError(f"Could not read Cemu memory at 0x{address:X} (Mach error {result}).")
+            raise OSError(f"Could not read game memory at 0x{address:X} (Mach error {result}).")
         return buffer.raw[:size]
 
     def write(self, address: int, data: bytes) -> None:
         if not self._connected:
-            raise OSError("Not connected to Cemu.")
+            raise OSError("Not connected to the game.")
         buffer = ctypes.create_string_buffer(data)
         result = self._write(
             self._task.value,
@@ -279,27 +298,66 @@ class MachProcessMemory:
             len(data),
         )
         if result != 0:
-            raise OSError(f"Could not write Cemu memory at 0x{address:X} (Mach error {result}).")
+            raise OSError(f"Could not write game memory at 0x{address:X} (Mach error {result}).")
 
     def __del__(self) -> None:
         if getattr(self, "_connected", False):
             self.disconnect()
 
 
+class SaveNotLoaded(ValueError):
+    """The game is running but no save file is loaded yet (title screen, file select)."""
+
+
 class GameMemory:
+    SIZES = {"u8": 1, "u16": 2, "u32": 4, "f32": 4}
+
     def __init__(self, backend: MachProcessMemory, base: int) -> None:
         self.backend = backend
         self.base = base
+        self._pinned_save: int | None = None
+
+    def _host(self, guest: int, size: int) -> int:
+        return self.base + self._guest(guest, size)
+
+    def _guest(self, address: int, size: int) -> int:
+        if address < SAVE_REL:
+            return address
+        return self.save_base() + address - SAVE_REL
+
+    def save_base(self) -> int:
+        """Guest address of the live save data, validated against the player data limits."""
+        if self._pinned_save is not None:
+            return self._pinned_save
+        pointer = unpack_value(self.backend.read(self.base + SAVE_POINTER, 4), "u32")
+        save = int(pointer) + SAVE_PLAYER_DELTA
+        if not 0x10000 < pointer < 0xFFFF0000:
+            raise SaveNotLoaded("No save file is loaded yet. Load a Quest Log in the game.")
+        header = self.backend.read(self.base + save, 0x15)
+        max_life, life, rupees = struct.unpack(">HHH", header[:6])
+        wallet = header[0x12]
+        if not (12 <= max_life <= 80 and life <= max_life and rupees <= 5000 and wallet <= 2):
+            raise SaveNotLoaded("No save file is loaded yet. Load a Quest Log in the game.")
+        return save
+
+    def pin(self) -> None:
+        """Resolve the save data once and reuse it, for a batch of reads."""
+        self._pinned_save = None
+        self._pinned_save = self.save_base()
+
+    def unpin(self) -> None:
+        self._pinned_save = None
 
     def read(self, offset: int, kind: str) -> int | float:
-        sizes = {"u8": 1, "u16": 2, "f32": 4}
-        return unpack_value(self.backend.read(self.base + offset, sizes[kind]), kind)
+        size = self.SIZES[kind]
+        return unpack_value(self.backend.read(self._host(offset, size), size), kind)
 
     def read_bytes(self, offset: int, size: int) -> bytes:
-        return self.backend.read(self.base + offset, size)
+        return self.backend.read(self._host(offset, size), size)
 
     def write(self, offset: int, value: int | float, kind: str) -> None:
-        self.backend.write(self.base + offset, pack_value(value, kind))
+        data = pack_value(value, kind)
+        self.backend.write(self._host(offset, len(data)), data)
 
     def set_bit(self, offset: int, bit: int, enabled: bool) -> None:
         current = int(self.read(offset, "u8"))
@@ -310,7 +368,7 @@ class GameMemory:
 class TrainerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Wind Waker HD Trainer · Cemu")
+        self.root.title("Wind Waker HD Trainer · Recomp")
         self.root.geometry("780x720")
         self.root.minsize(700, 620)
         self.backend: MachProcessMemory | None = None
@@ -330,13 +388,13 @@ class TrainerApp:
         ttk.Label(header, text="Wind Waker HD", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="A macOS trainer for The Legend of Zelda: The Wind Waker HD in Cemu",
+            text="A macOS trainer for the native Wind Waker HD port (ZeldaWWHDRecomp)",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(2, 10))
 
-        connection = ttk.LabelFrame(root, text="Cemu connection", padding=10)
+        connection = ttk.LabelFrame(root, text="Game connection", padding=10)
         connection.pack(fill="x", padx=18, pady=(0, 10))
-        self.base_var = tk.StringVar()
+        self.base_var = tk.StringVar(value=f"0x{DEFAULT_GUEST_BASE:X}")
         ttk.Label(connection, text="Game memory base").grid(row=0, column=0, sticky="w")
         ttk.Entry(connection, textvariable=self.base_var, width=20).grid(
             row=0, column=1, padx=(8, 12), sticky="w"
@@ -344,7 +402,7 @@ class TrainerApp:
         ttk.Button(connection, text="Connect / refresh", command=self.connect).grid(
             row=0, column=2, sticky="w"
         )
-        self.status_var = tk.StringVar(value="Start Cemu and load Wind Waker HD, then connect.")
+        self.status_var = tk.StringVar(value="Start Wind Waker HD, load a save, then connect.")
         ttk.Label(connection, textvariable=self.status_var, style="Muted.TLabel").grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(8, 0)
         )
@@ -415,17 +473,17 @@ class TrainerApp:
         return group
 
     def _build_player(self) -> None:
-        health = self._group(self.player_tab, "Health and stamina")
+        health = self._group(self.player_tab, "Health and magic")
         self._number_control(health, 0, "Health (quarters)", "health", "u16", 0, 80)
         self._number_control(health, 1, "Maximum health", "max_health", "u16", 0, 80)
-        ttk.Label(health, text="Stamina capacity").grid(row=2, column=0, sticky="w", pady=3)
-        self.stamina_cap = tk.StringVar(value="32")
+        ttk.Label(health, text="Magic capacity").grid(row=2, column=0, sticky="w", pady=3)
+        self.magic_cap = tk.StringVar(value="32")
         ttk.Combobox(
-            health, textvariable=self.stamina_cap, values=("0", "16", "32"),
+            health, textvariable=self.magic_cap, values=("0", "16", "32"),
             state="readonly", width=8,
         ).grid(row=2, column=1, sticky="w", padx=8, pady=3)
-        ttk.Button(health, text="Set", command=self._set_stamina_cap).grid(row=2, column=2)
-        self._number_control(health, 3, "Current stamina", "stamina", "u8", 0, 255)
+        ttk.Button(health, text="Set", command=self._set_magic_cap).grid(row=2, column=2)
+        self._number_control(health, 3, "Current magic", "magic", "u8", 0, 32)
         self.infinite_breath = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             health, text="Infinite underwater breath", variable=self.infinite_breath
@@ -596,6 +654,7 @@ class TrainerApp:
                     OFFSETS["songs"], bit, self.song_vars[bit].get()
                 ),
             ).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 20), pady=2)
+        self.bit_sets[OFFSETS["songs"]] = tuple(self.song_vars)
 
     def _build_inventory(self) -> None:
         group = self._group(self.inventory_tab, "Inventory item slots")
@@ -698,17 +757,15 @@ class TrainerApp:
 
     def connect(self) -> None:
         try:
-            pid = find_cemu_pid()
-            if pid is None:
-                raise OSError("Could not find exactly one running Cemu process.")
-            base_text = self.base_var.get().strip()
-            base = int(base_text, 16 if not base_text.lower().startswith("0x") else 0) if base_text else find_cemu_base()
-            if base is None or base <= 0:
-                raise ValueError(
-                    "Cemu's game memory base was not found in log.txt. Enter the base "
-                    "address shown in Cemu's log, then connect again."
-                )
-            if base > 0xFFFFFFFFFFFFFFFF - max(OFFSETS.values()):
+            pids = find_game_pids()
+            if not pids:
+                raise OSError("Could not find a running Wind Waker HD process.")
+            if len(pids) > 1:
+                raise OSError(f"Found several Wind Waker HD processes ({pids}); close the extras.")
+            pid = pids[0]
+            base_text = self.base_var.get().strip() or f"0x{DEFAULT_GUEST_BASE:X}"
+            base = int(base_text, 0 if base_text.lower().startswith("0x") else 16)
+            if not 0 < base <= 0xFFFFFFFFFFFFFFFF - 0xFFFFFFFF:
                 raise ValueError("The base address is outside the supported address range.")
             backend = MachProcessMemory()
             backend.connect(pid)
@@ -718,19 +775,19 @@ class TrainerApp:
             self.game = GameMemory(backend, base)
             self.pid = pid
             self.base_var.set(f"0x{base:X}")
-            self.status_var.set(f"Connected to Cemu (PID {pid}) · base 0x{base:X}")
+            self.status_var.set(f"Connected to Wind Waker HD (PID {pid}) · base 0x{base:X}")
             self.refresh()
         except (OSError, ValueError) as exc:
             self.status_var.set(str(exc))
-            messagebox.showerror("Cemu connection failed", str(exc), parent=self.root)
+            messagebox.showerror("Game connection failed", str(exc), parent=self.root)
 
     def _write(self, offset: int, value: int | float, kind: str) -> None:
         if self.game is None:
-            self.status_var.set("Connect to Cemu before changing game values.")
+            self.status_var.set("Connect to the game before changing values.")
             return
         try:
             self.game.write(offset, value, kind)
-            self.status_var.set(f"Updated game memory at 0x{offset:X}.")
+            self.status_var.set("Updated game memory.")
         except (OSError, ValueError) as exc:
             self._memory_error(exc)
 
@@ -745,8 +802,8 @@ class TrainerApp:
         except ValueError as exc:
             messagebox.showerror("Invalid value", str(exc), parent=self.root)
 
-    def _set_stamina_cap(self) -> None:
-        self._write(OFFSETS["max_stamina"], int(self.stamina_cap.get()), "u8")
+    def _set_magic_cap(self) -> None:
+        self._write(OFFSETS["max_magic"], int(self.magic_cap.get()), "u8")
 
     def _set_wallet_cap(self) -> None:
         encoded = {"500": 0, "1000": 1, "5000": 2}[self.wallet_cap.get()]
@@ -770,10 +827,15 @@ class TrainerApp:
         if value is None:
             value = self.gear_vars[name].get()
         self._write(address, int(value), "u8")
+        item_id = INVENTORY_ITEMS.get(name)
+        if item_id is not None and address in GEAR_FLAGS.values():
+            # The "got" flag for slot N sits at save+0x51+N; the item itself lives in slot N.
+            slot = address - SAVE_REL - 0x51
+            self._write(INVENTORY_SLOTS + slot, item_id if value else EMPTY_SLOT, "u8")
 
     def _set_bit(self, offset: int, bit: int, enabled: bool) -> None:
         if self.game is None:
-            self.status_var.set("Connect to Cemu before changing game values.")
+            self.status_var.set("Connect to the game before changing values.")
             return
         try:
             self.game.set_bit(offset, bit, enabled)
@@ -782,7 +844,7 @@ class TrainerApp:
 
     def _set_map(self, name: str) -> None:
         if self.game is None:
-            self.status_var.set("Connect to Cemu before changing game values.")
+            self.status_var.set("Connect to the game before changing values.")
             return
         address = OFFSETS["map_grid"] + (ord(name[0]) - ord("A")) * 7 + int(name[1]) - 1
         unlocked = self.map_vars[name].get()
@@ -793,7 +855,7 @@ class TrainerApp:
         if item_id is None:
             messagebox.showerror("Invalid item", "Choose an item from the list.", parent=self.root)
             return
-        self._write(0x145B7BBC + slot, item_id, "u8")
+        self._write(INVENTORY_SLOTS + slot, item_id, "u8")
 
     def _refresh_bits(self, offset: int, variables: tuple[tk.BooleanVar, ...]) -> None:
         if self.game is None:
@@ -811,20 +873,24 @@ class TrainerApp:
             return
         self.refreshing = True
         try:
+            self.game.pin()
             for key, kind in (
-                ("health", "u16"), ("max_health", "u16"), ("stamina", "u8"),
+                ("health", "u16"), ("max_health", "u16"), ("magic", "u8"),
                 ("rupees", "u16"), ("beedle_points", "u8"), ("arrows", "u8"),
                 ("bombs", "u8"), ("max_arrows", "u8"), ("max_bombs", "u8"),
             ):
                 self.variables[key].set(str(self.game.read(OFFSETS[key], kind)))
             capacity = int(self.game.read(OFFSETS["rupee_capacity"], "u8"))
             self.wallet_cap.set({0: "500", 1: "1000", 2: "5000"}.get(capacity, "500"))
-            self.stamina_cap.set(str(self.game.read(OFFSETS["max_stamina"], "u8")))
+            self.magic_cap.set(str(self.game.read(OFFSETS["max_magic"], "u8")))
             for axis, variable in self.position_vars.items():
                 variable.set(f"{float(self.game.read(OFFSETS[f'player_{axis}'], 'f32')):.3f}")
             for name, variable in self.gear_vars.items():
-                value = int(self.game.read(GEAR_FLAGS[name], "u8"))
-                variable.set(value != 0)
+                if name in INVENTORY_ITEMS:
+                    slot = GEAR_FLAGS[name] - SAVE_REL - 0x51
+                    variable.set(int(self.game.read(INVENTORY_SLOTS + slot, "u8")) != EMPTY_SLOT)
+                else:
+                    variable.set(int(self.game.read(GEAR_FLAGS[name], "u8")) != 0)
             bow_value = int(self.game.read(OFFSETS["bow"], "u8"))
             self.bow_var.set({
                 0: "Not unlocked",
@@ -846,19 +912,24 @@ class TrainerApp:
             for name, variable in self.map_vars.items():
                 address = OFFSETS["map_grid"] + (ord(name[0]) - ord("A")) * 7 + int(name[1]) - 1
                 variable.set(map_bytes[address - OFFSETS["map_grid"]] != 0)
-            inventory_bytes = self.game.read_bytes(0x145B7BBC, len(self.inventory_vars))
+            inventory_bytes = self.game.read_bytes(INVENTORY_SLOTS, len(self.inventory_vars))
             for slot, variable in enumerate(self.inventory_vars):
                 item_id = inventory_bytes[slot]
                 variable.set(self.inventory_item_ids.get(item_id, f"Unknown item ({item_id})"))
             if self.infinite_breath.get():
                 self.game.write(OFFSETS["breath"], 900, "u16")
-            self.status_var.set(f"Connected to Cemu (PID {self.pid}) · refreshed")
+            self.status_var.set(f"Connected to Wind Waker HD (PID {self.pid}) · refreshed")
         except (OSError, ValueError, StopIteration) as exc:
             self._memory_error(exc)
         finally:
+            if self.game is not None:
+                self.game.unpin()
             self.refreshing = False
 
     def _memory_error(self, error: Exception) -> None:
+        if isinstance(error, SaveNotLoaded):
+            self.status_var.set(str(error))
+            return
         self.status_var.set(f"Memory access failed: {error}")
         if self.backend is not None:
             self.backend.disconnect()
