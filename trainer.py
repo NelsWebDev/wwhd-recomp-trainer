@@ -94,6 +94,22 @@ GEAR_FLAGS = {name: _runtime_address(address) for name, address in _CEMU_GEAR_FL
 INVENTORY_SLOTS = _runtime_address(0x145B7BBC)
 EMPTY_SLOT = 0xFF
 
+# dStage_nextStage_c inside g_dComIfG_gameInfo.play: name[8], point s16, room s8, layer s8,
+# enabled u8, wipe u8. Setting "enabled" makes the game start the stage change.
+PLAY_BASE = 0x1046F0B0
+NEXT_STAGE = PLAY_BASE + 0x5140
+CURRENT_STAGE = PLAY_BASE + 0x5134
+
+WARP_PRESETS = {
+    "Great Sea": ("sea", 0, 0),
+    "Forsaken Fortress": ("M_NewD2", 0, 0),
+    "Dragon Roost Cavern": ("M_Dra09", 0, 0),
+    "Forbidden Woods": ("kindan", 0, 0),
+    "Tower of the Gods": ("Siren", 0, 0),
+    "Earth Temple": ("M_Dai", 0, 0),
+    "Wind Temple": ("kaze", 0, 0),
+}
+
 SONG_NAMES = (
     "Wind's Requiem",
     "Ballad of Gales",
@@ -359,6 +375,9 @@ class GameMemory:
         data = pack_value(value, kind)
         self.backend.write(self._host(offset, len(data)), data)
 
+    def write_bytes(self, offset: int, data: bytes) -> None:
+        self.backend.write(self._host(offset, len(data)), data)
+
     def set_bit(self, offset: int, bit: int, enabled: bool) -> None:
         current = int(self.read(offset, "u8"))
         value = current | (1 << bit) if enabled else current & ~(1 << bit)
@@ -460,6 +479,9 @@ class TrainerApp:
         self.tabs.add(progress_page, text="Progress")
         self.tabs.add(self.items_tab, text="Equipment")
         self.tabs.add(inventory_page, text="Inventory")
+        self.warp_tab = ttk.Frame(self.tabs, padding=12)
+        self.tabs.add(self.warp_tab, text="Warp")
+        self._build_warp()
         self._build_player()
         self._build_progress()
         self._build_items()
@@ -471,6 +493,100 @@ class TrainerApp:
         group = ttk.LabelFrame(parent, text=title, padding=10, style="Section.TLabelframe")
         group.pack(fill="x", pady=(0, 10))
         return group
+
+    def _build_warp(self) -> None:
+        group = self._group(self.warp_tab, "Warp to a stage")
+        ttk.Label(group, text="Preset").grid(row=0, column=0, sticky="w", pady=3)
+        self.warp_preset = tk.StringVar(value="Choose...")
+        preset = ttk.Combobox(
+            group, textvariable=self.warp_preset, values=tuple(WARP_PRESETS),
+            state="readonly", width=29,
+        )
+        preset.grid(row=0, column=1, columnspan=2, sticky="w", padx=8, pady=3)
+        preset.bind("<<ComboboxSelected>>", self._apply_warp_preset)
+        self.warp_vars = {
+            "stage": tk.StringVar(value="sea"),
+            "room": tk.StringVar(value="0"),
+            "spawn": tk.StringVar(value="0"),
+            "layer": tk.StringVar(value="-1"),
+        }
+        for row, (label, key) in enumerate(
+            (("Stage name", "stage"), ("Room", "room"), ("Spawn point", "spawn"), ("Layer (-1 = default)", "layer")),
+            start=1,
+        ):
+            ttk.Label(group, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(group, textvariable=self.warp_vars[key], width=14).grid(
+                row=row, column=1, sticky="w", padx=8, pady=3
+            )
+        ttk.Button(group, text="Warp", command=self._warp).grid(row=5, column=1, sticky="w", padx=8, pady=6)
+        self.current_stage_var = tk.StringVar(value="Current stage: -")
+        ttk.Label(group, textvariable=self.current_stage_var, style="Muted.TLabel").grid(
+            row=6, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Label(
+            group,
+            text="Stage names are the game's internal names (e.g. sea, M_Dra09). The Great Sea "
+            "uses the room as the sector number (1-49). Warp from a normal, controllable state.",
+            style="Muted.TLabel", wraplength=640, justify="left",
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        chart = self._group(self.warp_tab, "Sea chart (click a sector to warp there)")
+        landmarks = {"A1": "Fortress", "B4": "Windfall", "G2": "Outset"}
+        for col in range(7):
+            ttk.Label(chart, text=str(col + 1), style="Muted.TLabel").grid(row=0, column=col + 1)
+        for row in range(7):
+            letter = chr(ord("A") + row)
+            ttk.Label(chart, text=letter, style="Muted.TLabel").grid(row=row + 1, column=0, padx=(0, 4))
+            for col in range(7):
+                name = f"{letter}{col + 1}"
+                ttk.Button(
+                    chart, text=landmarks.get(name, name), width=9,
+                    command=lambda n=name: self._warp_sea(n),
+                ).grid(row=row + 1, column=col + 1, padx=1, pady=1)
+
+    def _warp_sea(self, name: str) -> None:
+        room = (ord(name[0]) - ord("A")) * 7 + int(name[1])
+        self.warp_vars["stage"].set("sea")
+        self.warp_vars["room"].set(str(room))
+        self.warp_vars["layer"].set("-1")
+        self._warp()
+
+    def _apply_warp_preset(self, _event: object = None) -> None:
+        stage, room, spawn = WARP_PRESETS[self.warp_preset.get()]
+        self.warp_vars["stage"].set(stage)
+        self.warp_vars["room"].set(str(room))
+        self.warp_vars["spawn"].set(str(spawn))
+        self.warp_vars["layer"].set("-1")
+
+    def _warp(self) -> None:
+        if self.game is None:
+            self.status_var.set("Connect to the game before warping.")
+            return
+        try:
+            stage = self.warp_vars["stage"].get().strip()
+            if not 1 <= len(stage) <= 7 or not stage.isascii():
+                raise ValueError("Stage name must be 1-7 ASCII characters.")
+            room = int(self.warp_vars["room"].get())
+            spawn = int(self.warp_vars["spawn"].get())
+            layer = int(self.warp_vars["layer"].get())
+            if not 0 <= room <= 63 or not -1 <= layer <= 14 or not 0 <= spawn <= 255:
+                raise ValueError("Room must be 0-63, spawn 0-255 and layer -1 to 14.")
+        except ValueError as exc:
+            messagebox.showerror("Invalid warp", str(exc), parent=self.root)
+            return
+        try:
+            if int(self.game.read(NEXT_STAGE + 12, "u8")):
+                self.status_var.set("A stage change is already in progress.")
+                return
+            self.game.write_bytes(NEXT_STAGE, stage.encode("ascii").ljust(8, b"\0"))
+            self.game.write(NEXT_STAGE + 8, spawn, "u16")
+            self.game.write(NEXT_STAGE + 10, room & 0xFF, "u8")
+            self.game.write(NEXT_STAGE + 11, layer & 0xFF, "u8")
+            self.game.write(NEXT_STAGE + 13, 0, "u8")
+            self.game.write(NEXT_STAGE + 12, 1, "u8")
+            self.status_var.set(f"Warping to {stage} (room {room}, spawn {spawn}).")
+        except (OSError, ValueError) as exc:
+            self._memory_error(exc)
 
     def _build_player(self) -> None:
         health = self._group(self.player_tab, "Health and magic")
@@ -930,6 +1046,8 @@ class TrainerApp:
                 variable.set(self.inventory_item_ids.get(item_id, f"Unknown item ({item_id})"))
             if self.infinite_breath.get():
                 self.game.write(OFFSETS["breath"], 900, "u16")
+            stage = self.game.read_bytes(CURRENT_STAGE, 8).split(b"\0")[0].decode("ascii", "replace")
+            self.current_stage_var.set(f"Current stage: {stage or '-'}")
             self.status_var.set(f"Connected to Wind Waker HD (PID {self.pid}) · refreshed")
         except (OSError, ValueError, StopIteration) as exc:
             self._memory_error(exc)
