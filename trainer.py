@@ -94,11 +94,33 @@ GEAR_FLAGS = {name: _runtime_address(address) for name, address in _CEMU_GEAR_FL
 INVENTORY_SLOTS = _runtime_address(0x145B7BBC)
 EMPTY_SLOT = 0xFF
 
+# The current stage's dSv_memBit_c inside the save info: small keys, then map/compass/boss key bits.
+DUNGEON_KEYS = SAVE_REL + 0x778 + 0x20
+DUNGEON_ITEMS = SAVE_REL + 0x778 + 0x21
+
+# Spoils bag: item list at +0x76 (u8[8]), "got" bits at +0x94, counts at +0x9C, one per spoils
+# type in the game's dBeastIdx order.
+BEAST_ITEMS = SAVE_REL + 0x76
+BEAST_FLAGS = SAVE_REL + 0x94
+BEAST_COUNTS = SAVE_REL + 0x9C
+SPOILS = (
+    ("Skull Necklaces", 0x45),
+    ("Boko Baba Seeds", 0x46),
+    ("Golden Feathers", 0x47),
+    ("Knight's Crests", 0x48),
+    ("Red Chu Jelly", 0x49),
+    ("Green Chu Jelly", 0x4A),
+    ("Blue Chu Jelly", 0x4B),
+    ("Joy Pendants", 0x1F),
+)
+
 # dStage_nextStage_c inside g_dComIfG_gameInfo.play: name[8], point s16, room s8, layer s8,
 # enabled u8, wipe u8. Setting "enabled" makes the game start the stage change.
 PLAY_BASE = 0x1046F0B0
 NEXT_STAGE = PLAY_BASE + 0x5140
 CURRENT_STAGE = PLAY_BASE + 0x5134
+PLAYER_PTR = PLAY_BASE + 0x5B34  # mpPlayerPtr[0]: pointer to Link's actor
+ACTOR_ROOM = 0x326               # fopAc_ac_c room number (s8)
 
 _SEA_ROWS = (
     "Forsaken Fortress|Star Island|Northern Fairy Island|Gale Isle|Crescent Moon Island|Seven-Star Isles|Overlook Island",
@@ -399,6 +421,19 @@ class GameMemory:
         self.write(offset, value, "u8")
 
 
+class GuardedVar(tk.StringVar):
+    """A StringVar whose programmatic updates are skipped while its widget has focus."""
+
+    def set(self, value: object) -> None:
+        try:
+            focused = self._root.focus_get()
+            if focused is not None and str(focused.cget("textvariable")) == str(self):
+                return
+        except (KeyError, tk.TclError, AttributeError):
+            pass
+        super().set(value)
+
+
 class TrainerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -467,7 +502,7 @@ class TrainerApp:
             "<Configure>",
             lambda event: progress_canvas.itemconfigure(progress_window, width=event.width),
         )
-        self.items_tab = ttk.Frame(self.tabs, padding=12)
+        self.items_page, self.items_tab = self._scrollable_page()
         inventory_page = ttk.Frame(self.tabs)
         inventory_canvas = tk.Canvas(inventory_page, highlightthickness=0)
         inventory_scrollbar = ttk.Scrollbar(
@@ -492,10 +527,10 @@ class TrainerApp:
         )
         self.tabs.add(self.player_tab, text="Player")
         self.tabs.add(progress_page, text="Progress")
-        self.tabs.add(self.items_tab, text="Equipment")
+        self.tabs.add(self.items_page, text="Equipment")
         self.tabs.add(inventory_page, text="Inventory")
-        self.warp_tab = ttk.Frame(self.tabs, padding=12)
-        self.tabs.add(self.warp_tab, text="Warp")
+        self.warp_page, self.warp_tab = self._scrollable_page()
+        self.tabs.add(self.warp_page, text="Warp")
         self._build_warp()
         self._build_player()
         self._build_progress()
@@ -508,6 +543,26 @@ class TrainerApp:
         group = ttk.LabelFrame(parent, text=title, padding=10, style="Section.TLabelframe")
         group.pack(fill="x", pady=(0, 10))
         return group
+
+    def _scrollable_page(self) -> tuple[ttk.Frame, ttk.Frame]:
+        page = ttk.Frame(self.tabs)
+        canvas = tk.Canvas(page, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(page, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas, padding=12)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+
+        def wheel(event: tk.Event) -> None:
+            if inner.winfo_height() > canvas.winfo_height():
+                canvas.yview_scroll(-event.delta, "units")
+
+        page.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", wheel))
+        page.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        return page, inner
 
     def _build_warp(self) -> None:
         group = self._group(self.warp_tab, "Warp to a stage")
@@ -530,10 +585,14 @@ class TrainerApp:
             start=1,
         ):
             ttk.Label(group, text=label).grid(row=row, column=0, sticky="w", pady=3)
-            ttk.Entry(group, textvariable=self.warp_vars[key], width=14).grid(
-                row=row, column=1, sticky="w", padx=8, pady=3
-            )
+            entry = ttk.Entry(group, textvariable=self.warp_vars[key], width=14)
+            entry.grid(row=row, column=1, sticky="w", padx=8, pady=3)
+            entry.bind("<Key>", lambda _e: self.follow_location.set(False))
         ttk.Button(group, text="Warp", command=self._warp).grid(row=5, column=1, sticky="w", padx=8, pady=6)
+        self.follow_location = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            group, text="Follow current location", variable=self.follow_location
+        ).grid(row=5, column=2, sticky="w", pady=6)
         self.current_stage_var = tk.StringVar(value="Current stage: -")
         ttk.Label(group, textvariable=self.current_stage_var, style="Muted.TLabel").grid(
             row=6, column=0, columnspan=3, sticky="w"
@@ -571,6 +630,7 @@ class TrainerApp:
         self._warp()
 
     def _apply_warp_preset(self, _event: object = None) -> None:
+        self.follow_location.set(False)
         stage, room, spawn = WARP_PRESETS[self.warp_preset.get()]
         self.warp_vars["stage"].set(stage)
         self.warp_vars["room"].set(str(room))
@@ -612,7 +672,7 @@ class TrainerApp:
         self._number_control(health, 0, "Health (quarters)", "health", "u16", 0, 80)
         self._number_control(health, 1, "Maximum health", "max_health", "u16", 0, 80)
         ttk.Label(health, text="Magic capacity").grid(row=2, column=0, sticky="w", pady=3)
-        self.magic_cap = tk.StringVar(value="32")
+        self.magic_cap = GuardedVar(value="32")
         ttk.Combobox(
             health, textvariable=self.magic_cap, values=("0", "16", "32"),
             state="readonly", width=8,
@@ -628,7 +688,7 @@ class TrainerApp:
         rupees = self._group(self.player_tab, "Rupees")
         self._number_control(rupees, 0, "Current rupees", "rupees", "u16", 0, 5000)
         ttk.Label(rupees, text="Wallet capacity").grid(row=1, column=0, sticky="w", pady=3)
-        self.wallet_cap = tk.StringVar(value="5000")
+        self.wallet_cap = GuardedVar(value="5000")
         ttk.Combobox(
             rupees, textvariable=self.wallet_cap, values=("500", "1000", "5000"),
             state="readonly", width=8,
@@ -641,7 +701,7 @@ class TrainerApp:
         self.position_vars = {}
         for row, axis in enumerate(("X", "Y", "Z")):
             ttk.Label(position, text=axis).grid(row=0, column=row * 2, padx=(0, 4))
-            variable = tk.StringVar(value="0.000")
+            variable = GuardedVar(value="0.000")
             self.position_vars[axis.lower()] = variable
             ttk.Entry(position, textvariable=variable, width=13).grid(
                 row=0, column=row * 2 + 1, padx=(0, 10)
@@ -662,7 +722,7 @@ class TrainerApp:
         maximum: int,
     ) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        variable = tk.StringVar(value="0")
+        variable = GuardedVar(value="0")
         self.variables[key] = variable
         ttk.Entry(parent, textvariable=variable, width=10).grid(
             row=row, column=1, sticky="w", padx=8, pady=3
@@ -673,7 +733,48 @@ class TrainerApp:
             command=lambda: self._set_number(key, kind, minimum, maximum),
         ).grid(row=row, column=2, sticky="w", pady=3)
 
+    def _build_dungeon(self) -> None:
+        group = self._group(self.progress_tab, "Current dungeon (applies to the stage you're in)")
+        ttk.Label(group, text="Small keys").grid(row=0, column=0, sticky="w", pady=3)
+        self.keys_var = GuardedVar(value="0")
+        ttk.Entry(group, textvariable=self.keys_var, width=6).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Button(group, text="Set", command=self._set_keys).grid(row=0, column=2, sticky="w")
+        ttk.Button(group, text="Give +1 key", command=lambda: self._add_keys(1)).grid(
+            row=0, column=3, sticky="w", padx=8
+        )
+        self.dungeon_vars = []
+        for bit, label in enumerate(("Map", "Compass", "Boss key")):
+            variable = tk.BooleanVar(value=False)
+            self.dungeon_vars.append(variable)
+            ttk.Checkbutton(
+                group, text=label, variable=variable,
+                command=lambda b=bit, v=variable: self._set_bit(DUNGEON_ITEMS, b, v.get()),
+            ).grid(row=1, column=bit, sticky="w", pady=3)
+
+    def _set_keys(self) -> None:
+        try:
+            count = int(self.keys_var.get(), 10)
+            if not 0 <= count <= 99:
+                raise ValueError("Enter a value from 0 to 99.")
+        except ValueError as exc:
+            messagebox.showerror("Invalid value", str(exc), parent=self.root)
+            return
+        self._write(DUNGEON_KEYS, count, "u8")
+
+    def _add_keys(self, amount: int) -> None:
+        if self.game is None:
+            self.status_var.set("Connect to the game before changing values.")
+            return
+        try:
+            count = min(99, int(self.game.read(DUNGEON_KEYS, "u8")) + amount)
+            self.game.write(DUNGEON_KEYS, count, "u8")
+            self.keys_var.set(str(count))
+            self.status_var.set(f"Small keys: {count}.")
+        except (OSError, ValueError) as exc:
+            self._memory_error(exc)
+
     def _build_progress(self) -> None:
+        self._build_dungeon()
         relics = self._group(self.progress_tab, "Relics and abilities")
         self._bit_controls(relics, "Pearls", ("Nayru", "Din", "Farore"), OFFSETS["pearls"], columns=3)
         self._bit_controls(
@@ -727,6 +828,49 @@ class TrainerApp:
             bit_positions=(0, 2, 4),
         )
 
+    def _build_spoils(self) -> None:
+        group = self._group(self.items_tab, "Spoils bag counts (0-99)")
+        self.spoils_vars: list[tk.StringVar] = []
+        for index, (label, _item) in enumerate(SPOILS):
+            row, column = divmod(index, 2)
+            ttk.Label(group, text=label).grid(row=row, column=column * 3, sticky="w", pady=3)
+            variable = GuardedVar(value="0")
+            self.spoils_vars.append(variable)
+            ttk.Entry(group, textvariable=variable, width=6).grid(
+                row=row, column=column * 3 + 1, sticky="w", padx=8, pady=3
+            )
+            ttk.Button(
+                group, text="Set", command=lambda i=index: self._set_spoils(i)
+            ).grid(row=row, column=column * 3 + 2, sticky="w", padx=(0, 16), pady=3)
+
+    def _set_spoils(self, index: int) -> None:
+        if self.game is None:
+            self.status_var.set("Connect to the game before changing values.")
+            return
+        try:
+            count = int(self.spoils_vars[index].get(), 10)
+            if not 0 <= count <= 99:
+                raise ValueError("Enter a value from 0 to 99.")
+        except ValueError as exc:
+            messagebox.showerror("Invalid value", str(exc), parent=self.root)
+            return
+        item = SPOILS[index][1]
+        try:
+            self.game.pin()
+            if count:
+                items = self.game.read_bytes(BEAST_ITEMS, 8)
+                if item not in items:
+                    if EMPTY_SLOT not in items:
+                        raise ValueError("The spoils bag is full.")
+                    self.game.write(BEAST_ITEMS + items.index(EMPTY_SLOT), item, "u8")
+                self.game.set_bit(BEAST_FLAGS, index, True)
+            self.game.write(BEAST_COUNTS + index, count, "u8")
+            self.status_var.set(f"Set {SPOILS[index][0]} to {count}.")
+        except (OSError, ValueError) as exc:
+            self._memory_error(exc)
+        finally:
+            self.game.unpin()
+
     def _build_items(self) -> None:
         combat = self._group(self.items_tab, "Weapons and ammunition")
         self._choice_control(combat, 0, "Sword", "sword", {
@@ -759,7 +903,7 @@ class TrainerApp:
             ).grid(row=row, column=column, sticky="w", padx=(0, 12), pady=2)
         bow_row = (len(gear_items) + 2) // 3
         ttk.Label(gear, text="Bow").grid(row=bow_row, column=0, sticky="w", pady=3)
-        self.bow_var = tk.StringVar(value="Not unlocked")
+        self.bow_var = GuardedVar(value="Not unlocked")
         self.bow_values = {
             "Not unlocked": 0,
             "Hero's Bow": 1,
@@ -790,6 +934,7 @@ class TrainerApp:
                 ),
             ).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 20), pady=2)
         self.bit_sets[OFFSETS["songs"]] = tuple(self.song_vars)
+        self._build_spoils()
 
     def _build_inventory(self) -> None:
         group = self._group(self.inventory_tab, "Inventory item slots")
@@ -805,7 +950,7 @@ class TrainerApp:
             ttk.Label(group, text=f"Slot {slot + 1:02}").grid(
                 row=row, column=0, sticky="w", padx=(0, 8), pady=2
             )
-            variable = tk.StringVar(value="Empty slot")
+            variable = GuardedVar(value="Empty slot")
             self.inventory_vars.append(variable)
             ttk.Combobox(
                 group,
@@ -878,7 +1023,7 @@ class TrainerApp:
         self, parent: ttk.LabelFrame, row: int, label: str, key: str, choices: dict[str, int]
     ) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        variable = tk.StringVar(value=next(iter(choices)))
+        variable = GuardedVar(value=next(iter(choices)))
         self.variables[key] = variable
         self.choice_maps = getattr(self, "choice_maps", {})
         self.choice_maps[key] = choices
@@ -1065,8 +1210,33 @@ class TrainerApp:
                 variable.set(self.inventory_item_ids.get(item_id, f"Unknown item ({item_id})"))
             if self.infinite_breath.get():
                 self.game.write(OFFSETS["breath"], 900, "u16")
+            counts = self.game.read_bytes(BEAST_COUNTS, len(SPOILS))
+            for variable, count in zip(self.spoils_vars, counts):
+                variable.set(str(count))
+            self.keys_var.set(str(self.game.read(DUNGEON_KEYS, "u8")))
+            flags = int(self.game.read(DUNGEON_ITEMS, "u8"))
+            for bit, variable in enumerate(self.dungeon_vars):
+                variable.set(bool(flags & (1 << bit)))
             stage = self.game.read_bytes(CURRENT_STAGE, 8).split(b"\0")[0].decode("ascii", "replace")
-            self.current_stage_var.set(f"Current stage: {stage or '-'}")
+            room_text = ""
+            room = None
+            link = int(self.game.read(PLAYER_PTR, "u32"))
+            if 0x10000 < link < 0xFFFF0000:
+                room = int(self.game.read(link + ACTOR_ROOM, "u8"))
+                room = room - 256 if room > 127 else room
+                room_text = f" · room {room}"
+            self.current_stage_var.set(f"Current stage: {stage or '-'}{room_text}")
+            if stage and self.follow_location.get():
+                self.warp_vars["stage"].set(stage)
+                if room is not None and room >= 0:
+                    self.warp_vars["room"].set(str(room))
+                point = int(self.game.read(CURRENT_STAGE + 8, "u16"))
+                if point < 256:
+                    self.warp_vars["spawn"].set(str(point))
+                layer = int(self.game.read(CURRENT_STAGE + 11, "u8"))
+                self.warp_vars["layer"].set(str(layer - 256 if layer > 127 else layer))
+                match = next((n for n, p in WARP_PRESETS.items() if p[0] == stage), "Choose...")
+                self.warp_preset.set(match)
             self.status_var.set(f"Connected to Wind Waker HD (PID {self.pid}) · refreshed")
         except (OSError, ValueError, StopIteration) as exc:
             self._memory_error(exc)
